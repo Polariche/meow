@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Callable, List, Optional, Tuple
-
+import numpy as np
 def gauss_newton(x, f):
     '''
     gauss-newton optimization
@@ -19,10 +19,16 @@ def lm(x, f, lamb = 1.1):
     '''
     levenberg-marquardt optimization
     '''
+    device = x.device
 
     y = f(x)
     dx = torch.autograd.grad(y, [x], grad_outputs=torch.ones_like(y), retain_graph=True, create_graph=True)[0]
- 
+
+    #compute in cpu?
+    #x = x.to("cpu")
+    #y = y.to("cpu")
+    #dx = dx.to("cpu")
+
     J = dx.unsqueeze(-1)
     Jt = J.transpose(-2, -1)
     JtJ = torch.matmul(Jt, J)
@@ -33,12 +39,31 @@ def lm(x, f, lamb = 1.1):
     diag_JtJ = diag_JtJ.view(-1, k, 1)
     diag_JtJ = torch.eye(k, device=x.device).unsqueeze(0).expand(diag_JtJ.shape[0], -1, -1) * diag_JtJ
  
-    pinv = torch.matmul(torch.pinverse(JtJ + lamb * diag_JtJ), Jt)
-
+    #pinv = torch.matmul(torch.pinverse(JtJ + lamb * diag_JtJ), Jt)
+    pinv = torch.matmul(1 / (JtJ + lamb * diag_JtJ), Jt)
     delta = - pinv * y.unsqueeze(-1)
     delta = delta[..., 0, :]
  
-    return x + delta
+    res = x + delta
+    #res = res.to(device)
+
+    return res
+
+def _pers_cam(x, pose):
+    cam_pos = x / x[..., -1].unsqueeze(-1)
+    cam_pos = torch.matmul(cam_pos, pose.transpose(-1,-2))
+    cam_pos = cam_pos[..., :2]
+    
+
+    return cam_pos
+
+def _ortho_cam(x, pose):
+    cam_pos = x
+    cam_pos = torch.matmul(cam_pos, pose.transpose(-1,-2))
+    cam_pos = cam_pos[..., :2]
+    
+
+    return cam_pos
 
 class LMRayMarcher(nn.Module):
     '''
@@ -51,14 +76,50 @@ class LMRayMarcher(nn.Module):
         self.lamb = lamb 
 
     def forward(self, x, u, f):
-        x = x
         d = torch.zeros_like(x)[..., :1].requires_grad_(True)
         
-        for _ in range(self.max_iter):
+        for i in range(self.max_iter):
             g = lambda d: f(x+d*u)
             d = lm(d, g, self.lamb)
 
         return d
+
+class RayMarcher(nn.Module):
+    def __init__(self, max_iter=20):
+        super(RayMarcher, self).__init__()
+        self.max_iter = max_iter
+
+    def forward(self, x, u, f):
+        d = torch.zeros_like(x)[..., :1].requires_grad_(True)
+        
+        for i in range(self.max_iter):
+            d = d + f(x+d*u)
+
+        return d
+
+class OrthogonalCamera(nn.Module):
+    def __init__(self, K):
+        super(OrthogonalCamera, self).__init__()
+        self.K = nn.parameter.Parameter(K)      # TODO : proper parametrization
+    
+    def forward(self, x):
+        # x : (..., pose_batch, N, 3)
+
+        return _ortho_cam(x, self.K)
+
+        
+
+class PerspectiveCamera(nn.Module):
+    def __init__(self, K):
+        super(PerspectiveCamera, self).__init__()
+        self.K = nn.parameter.Parameter(K)
+    
+    def forward(self, x, pose):
+        # x : (..., pose_batch, N, 3)
+
+        return _pers_cam(x, self.K)
+
+        
 
 
 class PointToPixel(nn.Module):
@@ -90,10 +151,7 @@ class PointToPixel(nn.Module):
         if self.blendmode in ('min', 'max'):
             img_ind = -torch.ones((x.shape[0], 1, self.H, self.W), dtype=torch.long, device=c.device)
 
-        Kx = x / x[..., 2:3]
-
-        Kx = torch.matmul(Kx, self.K.T)
-
+        Kx = _pers_cam(x, self.K)
         Kx = torch.round(Kx).long()
 
 
@@ -106,19 +164,33 @@ class PointToPixel(nn.Module):
             b_Kx = b_Kx[cond]
             ind = b_Kx[:, 0] + b_Kx[:, 1] * self.H
 
-            img[i] = img[i].view(c.shape[-1], self.H * self.W).index_add(1, ind, c[i, cond].T).view(c.shape[-1], self.H, self.W)
-            img_acc[i] = img_acc[i].view(1, self.H * self.W).index_add(1, ind, torch.ones((1, ind.shape[0])).long()).view(1, self.H, self.W)
+            if self.blendmode is 'average':
+                img[i] = img[i].view(c.shape[-1], self.H * self.W).index_add(1, ind, c[i, cond].T).view(c.shape[-1], self.H, self.W)
+                img_acc[i] = img_acc[i].view(1, self.H * self.W).index_add(1, ind, torch.ones((1, ind.shape[0]), device=c.device, dtype=torch.long)).view(1, self.H, self.W)
             
-            if self.blendmode in ('min', 'max'):
-                for j, (pt, val) in enumerate(zip(b_Kx, c[i, cond])):
-                    u, v = pt[1], pt[0]
-                    a = img[i, :, u, v]
-                    b = val * img_acc[i, :, u, v]
+            elif self.blendmode in ('min', 'max'):
+                inf = np.inf if self.blendmode is 'min' else -np.inf
+                cmp = min if self.blendmode is 'min' else max
 
-                    if (self.blendmode is 'min' and a > b) or (self.blendmode is 'max' and a < b):
-                        img[i, :, u, v] = b
-                        img_ind[i, :, u, v] = j
+                best_vals = [inf for _ in range(self.H * self.W)]
+                best_inds = [-1 for _ in range(self.H * self.W)]
 
+                for j, _ind in enumerate(ind):
+                    val = c[i, cond][j].squeeze().item()
+
+                    if cmp(best_vals[_ind], val) == val:
+                        best_vals[_ind] = val
+                        best_inds[_ind] = j
+
+                pixindex = [i for i in range(self.H * self.W) if best_inds[i] != -1]
+                
+                pixindex = torch.tensor(pixindex, device=c.device)
+                best_inds = torch.tensor(best_inds, dtype=torch.long, device=c.device)
+                best_inds = best_inds[pixindex]
+
+                ptvals = c[i, cond][best_inds].T
+
+                img[i] = img[i].view(c.shape[-1], self.H * self.W).index_add(1, pixindex, ptvals).view(c.shape[-1], self.H, self.W)
 
         img_acc[img_acc == 0] = 1
         img = img / img_acc

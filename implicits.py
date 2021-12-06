@@ -46,7 +46,7 @@ class SphereSDF(SDF):
         self.radius = nn.parameter.Parameter(radius)
 
     def forward(self, x):
-        return torch.sqrt((self.center - x).pow(2).sum(dim=-1, keepdim=True)) - self.radius
+        return torch.sqrt((self.center - x).pow(2).sum(dim=-1, keepdim=True) + 1e-9) - self.radius
     
     def intersect(self, x, u, half_line=True):
         # test two conditions:
@@ -252,7 +252,7 @@ class FCBlock(MetaModule):
 
         activations = OrderedDict()
 
-        x = coords.clone().detach().requires_grad_(True)
+        x = coords
         activations['input'] = x
         for i, layer in enumerate(self.net):
             subdict = get_subdict(params, 'net.%d' % i)
@@ -297,7 +297,7 @@ class SingleBVPNet(MetaModule):
             params = OrderedDict(self.named_parameters())
 
         # Enables us to compute gradients w.r.t. coordinates
-        coords_org = model_input['coords'].clone().detach().requires_grad_(True)
+        coords_org = model_input#.clone().detach().requires_grad_(True)
         coords = coords_org
 
         # various input processing methods for different applications
@@ -309,13 +309,13 @@ class SingleBVPNet(MetaModule):
             coords = self.positional_encoding(coords)
 
         output = self.net(coords, get_subdict(params, 'net'))
-        return {'model_in': coords_org, 'model_out': output}
+        return output
 
     def forward_with_activations(self, model_input):
         '''Returns not only model output, but also intermediate activations.'''
         coords = model_input['coords'].clone().detach().requires_grad_(True)
         activations = self.net.forward_with_activations(coords)
-        return {'model_in': coords, 'model_out': activations.popitem(), 'activations': activations}
+        return activations.popitem()
 
 class ImageDownsampling(nn.Module):
     '''Generate samples in u,v plane according to downsampling blur kernel'''
