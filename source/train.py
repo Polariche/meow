@@ -1,3 +1,17 @@
+# load RGB image & masks
+
+
+## sampling stage ##
+# sample from occupancy masks
+
+# sample from implicit
+
+
+# pass RGB image through CNN for features & camera pose
+
+
+# evaluate with DIF; minimize BCE occupancy on samples
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,7 +27,6 @@ import neural_implicits
 import utils.optimization
 import json
 
-torch.autograd.set_detect_anomaly(True)
 
 with open('./setups/setup1.json') as f:
     args = json.load(f)
@@ -28,7 +41,7 @@ device = "cuda"
 sphere = neural_implicits.SingleBVPNet(in_features=3, type='sine', num_hidden_layers=3).to(device)
 optimizer = Adam(sphere.parameters(), lr=args['learning_rate'])
 
-raymarcher = modules.RayMarcher(max_iter=args['raymarcher_max_iter'], sdf=sphere)
+raymarcher = modules.LMRayMarcher(max_iter=args['raymarcher_max_iter'], sdf=sphere)
 K = torch.tensor([[L/2, 0, L/2],
                     [0, L/2, L/2],
                     [0, 0, 1]], 
@@ -53,11 +66,9 @@ x_obj_sample_prev = torch.randn((N, 2), device=device)
 x_obj_sample_prev = torch.cat([x_obj_sample_prev, torch.ones_like(x_obj_sample_prev)[..., :1]], dim=-1)
 
 
-SS = modules.SilhouetteSampler(sdf=sphere, lr=1e-3, max_iter=50, scheduler=torch.optim.lr_scheduler.ExponentialLR, sch_args={'gamma': 0.97})
-
 x0 = None
 
-for i in range(1000):
+for i in range(100):
     # sample from image
     # UV -> cam coord
 
@@ -100,10 +111,7 @@ for i in range(1000):
     dx = torch.gather(dx, -2, torch.cat([argmin_ind.unsqueeze(-1)]*3, -1))[..., 0, :]
 
     # losses
-    occ_pts = -y / 1e-3 #sigmoid_f(- y / 1e-3)
-
-    
-
+    occ_pts = -y / 1e-3
     tar_pts = pfp(r, target)[0]
 
     bce_pts = F.binary_cross_entropy_with_logits(occ_pts, tar_pts)
@@ -111,47 +119,9 @@ for i in range(1000):
 
     loss = bce_pts + reg
 
-    #l2_pts = (sigmoid_f(occ_pts) - tar_pts).pow(2).sum(dim=-1).mean()
-
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-
-    # visualization
-    
-    occ = ptp(r, occ_pts)
-    tar = ptp(r, tar_pts)
-
-    bce = F.binary_cross_entropy_with_logits(occ, tar)
-    bce_dx = torch.autograd.grad(bce, [occ], retain_graph=True, create_graph=False)[0]
-
-    plt.imsave('results/occ_%d.png' % i, sigmoid_f(occ).squeeze().detach().cpu().numpy())
-    #plt.imsave('results/tar_%d.png' % i, tar.squeeze().detach().cpu().numpy())
-
-    plt.imsave('results/l2_occ_%d.png' % i, 2 * (tar - occ).squeeze().detach().cpu().numpy())
-    plt.imsave('results/bce_occ_%d.png' % i, - bce_dx.squeeze().detach().cpu().numpy())
-
-    visible_pts_inds = (occ_pts > 0.5).view(-1)
-    x_visible = x[visible_pts_inds]
-
-    #bounds = SS(x_visible, r[visible_pts_inds])
-
-    #_, dbounds = utils.optimization.y_dx(bounds, sphere)
-
-    #plt.imsave('results/bound_%d.png' % i, ptp(bounds, F.normalize(dbounds)*0.5 + 0.5).permute(1, 2, 0).detach().cpu().numpy())
-    
-
-    #res1 = torch.autograd.gradcheck(implicits.sphere, (x.double(), sphere.center.double(), sphere.radius.double()))
-    #res2 = torch.autograd.gradgradcheck(implicits.sphere, (x.double(), sphere.center.double(), sphere.radius.double()))
-
-    #print(res1, res2)
-
-    #with torch.no_grad():
-    #    visible_pts_inds = (occ_pts > 0.5).view(-1)
-    #    x_obj_sample_prev = x[visible_pts_inds]
-
-    
-    #plt.imsave('results/tar_occ_bce_%d.png' % i, bce.squeeze().detach().cpu().numpy())
 
 

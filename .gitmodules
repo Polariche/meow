@@ -1,0 +1,3 @@
+[submodule "CelebAMask-HQ"]
+	path = CelebAMask-HQ
+	url = https://github.com/switchablenorms/CelebAMask-HQ.git

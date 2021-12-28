@@ -12,9 +12,6 @@ import geometry
 import neural_implicits
 import utils.optimization
 import json
-from scene_dataset import SceneDataset
-from torch.utils.data import DataLoader
-import math 
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -31,70 +28,64 @@ device = "cuda"
 sphere = neural_implicits.SingleBVPNet(in_features=3, type='sine', num_hidden_layers=3).to(device)
 optimizer = Adam(sphere.parameters(), lr=args['learning_rate'])
 
-raymarcher = modules.RayMarcher(max_iter=args['raymarcher_max_iter'], sdf=sphere)
+raymarcher = modules.LMRayMarcher(max_iter=args['raymarcher_max_iter'], sdf=sphere)
+K = torch.tensor([[L/2, 0, L/2],
+                    [0, L/2, L/2],
+                    [0, 0, 1]], 
+                    dtype=torch.float, device=device)
+K_inv = torch.inverse(K)
+
+cam = modules.PerspectiveCamera(K)
+ptp = modules.PointToPixel(L, L, cam, blendmode='average')
+pfp = modules.PointFromPixel()
 
 
 celoss_f = nn.BCEWithLogitsLoss()
 sigmoid_f = nn.Sigmoid()
 
+
+# load target img
+target = torch.from_numpy(np.asarray(Image.open("./data/toy/test_img2.png"))).permute(2,0,1)[:1].to(device)
+target = target.float()/255
+
 # initialize obj iso-points
 x_obj_sample_prev = torch.randn((N, 2), device=device)
 x_obj_sample_prev = torch.cat([x_obj_sample_prev, torch.ones_like(x_obj_sample_prev)[..., :1]], dim=-1)
 
-scenes = DataLoader(SceneDataset(False, 'DTU', (L, L), args['scan_num']), batch_size=args['batch_size'], shuffle=True)
-iterator = iter(scenes)
 
-_, samples, _ = next(iterator)
-targets = samples['object_mask'].unsqueeze(1).float().to(device)
+SS = modules.SilhouetteSampler(sdf=sphere, lr=1e-3, max_iter=50, scheduler=torch.optim.lr_scheduler.ExponentialLR, sch_args={'gamma': 0.97})
+
+x0 = None
 
 for i in range(100):
     # sample from image
     # UV -> cam coord
 
-    #_, samples, _ = next(iterator)
-    #targets = samples['object_mask']
-
     with torch.no_grad():
-        x_img_sample = []
-        for target in targets:
-                
-            # sample (u, v) by prob
-            inds = torch.tensor(list(torch.utils.data.WeightedRandomSampler(target.float().view(-1), N, replacement=True)))
-            H, W = target.shape[-2:]
-            uv = torch.tensor([[ind % H, ind // H] for ind in inds], device=device)
+        # sample (u, v) by prob
+        inds = torch.tensor(list(torch.utils.data.WeightedRandomSampler(target.view(-1), N, replacement=True)))
+        H, W = target.shape[-2:]
+        uv = torch.tensor([[ind % H, ind // H] for ind in inds], device=device)
 
-            target_K = torch.tensor([[W/2, 0, W/2],
-                                    [0, H/2, H/2],
-                                    [0, 0, 1]], 
-                                    dtype=torch.float, device=device)
-            target_K_inv = torch.inverse(target_K)
+        # convert to world
+        uv1 = torch.cat([uv, torch.ones_like(uv)[..., :1]], dim=-1).float()
+        x_img_sample = torch.matmul(uv1, K_inv.transpose(-1,-2))
 
-            # convert to world
-            uv1 = torch.cat([uv, torch.ones_like(uv)[..., :1]], dim=-1).float()
-            b_x_img_sample = torch.matmul(uv1, target_K_inv.transpose(-1,-2))
-
-            # gaussian perturbance
-            b_x_img_sample += torch.randn(b_x_img_sample.shape, device=device) * args['point_sample_perturb']
-            x_img_sample.append(b_x_img_sample)
-
-        x_img_sample = torch.cat(x_img_sample, dim=0)
+        # gaussian perturbance
+        x_img_sample += torch.randn(x_img_sample.shape, device=device) * args['point_sample_perturb']
 
 
         # sample from estimated locations
         # from prev.iter + gaussian perturbance
-
         x_obj_sample = x_obj_sample_prev + torch.randn(x_obj_sample_prev.shape, device=device) * args['point_sample_perturb']
 
 
-        r = torch.cat([x_img_sample, torch.cat([x_obj_sample] * args['batch_size'], dim=0)], dim=-2)
-        r = r / r[..., -1:]
+    r = torch.cat([x_img_sample, x_obj_sample], dim=0)
+    r = r / r[..., -1:]
 
-        x0 = torch.zeros_like(r)
+    x0 = torch.zeros_like(r)
 
-        cam = modules.PerspectiveCamera(target_K)
-        ptp = modules.PointToPixel(H, W, cam, blendmode='average')
-        pfp = modules.PointFromPixel()
-
+    #d = raymarcher(x0, r).unsqueeze(-2)
     d = torch.randn(*r.shape[:-1], args['number_of_dist_samples'], 1, device=r.device) * args['dist_perturb'] + 1
     x = x0.unsqueeze(-2)+d*r.unsqueeze(-2)
 
@@ -131,18 +122,34 @@ for i in range(100):
     
     occ = ptp(r, occ_pts)
     tar = ptp(r, tar_pts)
-    gra = ptp(r, dx)
 
     bce = F.binary_cross_entropy_with_logits(occ, tar)
     bce_dx = torch.autograd.grad(bce, [occ], retain_graph=True, create_graph=False)[0]
 
     plt.imsave('results/occ_%d.png' % i, sigmoid_f(occ).squeeze().detach().cpu().numpy())
-    plt.imsave('results/tar_%d.png' % i, tar.squeeze().detach().cpu().numpy())
+    #plt.imsave('results/tar_%d.png' % i, tar.squeeze().detach().cpu().numpy())
 
-    #plt.imsave('results/l2_occ_%d.png' % i, 2 * (tar - occ).squeeze().detach().cpu().numpy())
+    plt.imsave('results/l2_occ_%d.png' % i, 2 * (tar - occ).squeeze().detach().cpu().numpy())
     plt.imsave('results/bce_occ_%d.png' % i, - bce_dx.squeeze().detach().cpu().numpy())
-    plt.imsave('results/grad_%d.png' % i, F.normalize(gra, -1).permute(2, 1, 0).squeeze().detach().cpu().numpy())
+
+    plt.imsave('results/grad_%d.png' % i, (F.normalize(ptp(r, dx)) * 0.5 + 0.5).squeeze().permute(1,2,0).detach().cpu().numpy())
 
     visible_pts_inds = (occ_pts > 0.5).view(-1)
     x_visible = x[visible_pts_inds]
+
+    #bounds = SS(x_visible, r[visible_pts_inds])
+
+    #_, dbounds = utils.optimization.y_dx(bounds, sphere)
+
+    #plt.imsave('results/bound_%d.png' % i, ptp(bounds, F.normalize(dbounds)*0.5 + 0.5).permute(1, 2, 0).detach().cpu().numpy())
+    
+    #print(res1, res2)
+
+    #with torch.no_grad():
+    #    visible_pts_inds = (occ_pts > 0.5).view(-1)
+    #    x_obj_sample_prev = x[visible_pts_inds]
+
+    
+    #plt.imsave('results/tar_occ_bce_%d.png' % i, bce.squeeze().detach().cpu().numpy())
+
 

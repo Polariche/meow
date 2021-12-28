@@ -1,5 +1,5 @@
 {
-    "number_of_point_samples": 5000,
+    "number_of_point_samples": 20000,
     "number_of_dist_samples": 10,
     "learning_rate": 1e-4,
     "point_sample_perturb": 0,
